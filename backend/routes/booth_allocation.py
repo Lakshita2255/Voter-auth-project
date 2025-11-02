@@ -1,0 +1,358 @@
+from flask import Blueprint, request, jsonify, current_app
+import re
+
+booth_allocation_bp = Blueprint('booth_allocation', __name__)
+
+# ============================================
+# 1. Create Locality-to-Booth Mapping
+# ============================================
+@booth_allocation_bp.route('/create-mapping', methods=['POST'])  # ← Removed /api/booth-allocation/
+def create_mapping():
+    """
+    Create a new locality-to-booth mapping.
+    Example: { "locality_names": ["Keshav Nagar", "Gandhi Nagar"], "booth_id": "BOOTH001" }
+    """
+    try:
+        db = current_app.mongo.db  # ← Fixed: Use current_app.mongo.db
+        data = request.json
+        locality_names = data.get('locality_names', [])
+        booth_id = data.get('booth_id')
+        booth_name = data.get('booth_name')
+        
+        if not locality_names or not booth_id:
+            return jsonify({'error': 'locality_names and booth_id are required'}), 400
+        
+        # Normalize locality names (lowercase, strip whitespace)
+        normalized_localities = [name.strip().lower() for name in locality_names]
+        
+        # Check if mapping already exists
+        existing = db.locality_booth_mapping.find_one({'booth_id': booth_id})
+        
+        if existing:
+            # Update existing mapping
+            db.locality_booth_mapping.update_one(
+                {'booth_id': booth_id},
+                {'$set': {
+                    'locality_names': normalized_localities,
+                    'booth_name': booth_name
+                }}
+            )
+            message = 'Mapping updated successfully'
+        else:
+            # Create new mapping
+            db.locality_booth_mapping.insert_one({
+                'booth_id': booth_id,
+                'booth_name': booth_name,
+                'locality_names': normalized_localities
+            })
+            message = 'Mapping created successfully'
+        
+        return jsonify({'success': True, 'message': message}), 200
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# 2. Get All Locality-Booth Mappings
+# ============================================
+@booth_allocation_bp.route('/mappings', methods=['GET'])  # ← Removed /api/booth-allocation/
+def get_mappings():
+    """Get all locality-to-booth mappings"""
+    try:
+        db = current_app.mongo.db  # ← Fixed: Use current_app.mongo.db
+        mappings = list(db.locality_booth_mapping.find())
+        
+        # Convert ObjectId to string
+        for mapping in mappings:
+            mapping['_id'] = str(mapping['_id'])
+        
+        return jsonify({'mappings': mappings}), 200
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# 3. Delete a Mapping
+# ============================================
+@booth_allocation_bp.route('/delete-mapping/<booth_id>', methods=['DELETE'])  # ← Removed /api/booth-allocation/
+def delete_mapping(booth_id):
+    """Delete a locality-to-booth mapping"""
+    try:
+        db = current_app.mongo.db  # ← Fixed: Use current_app.mongo.db
+        result = db.locality_booth_mapping.delete_one({'booth_id': booth_id})
+        
+        if result.deleted_count > 0:
+            return jsonify({'success': True, 'message': 'Mapping deleted successfully'}), 200
+        else:
+            return jsonify({'error': 'Mapping not found'}), 404
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# 4. Auto-Allocate Booth Based on Address
+# ============================================
+@booth_allocation_bp.route('/auto-allocate', methods=['POST'])  # ← Removed /api/booth-allocation/
+def auto_allocate_booth():
+    """
+    Analyze an address and return the best matching booth.
+    Example: { "address": "610/1119, Keshav Nagar, Delhi" }
+    Returns: { "booth_id": "BOOTH001", "booth_name": "Central School", "matched_locality": "keshav nagar" }
+    """
+    try:
+        db = current_app.mongo.db  # ← Fixed: Use current_app.mongo.db
+        data = request.json
+        address = data.get('address', '').strip().lower()
+        
+        if not address:
+            return jsonify({'error': 'Address is required'}), 400
+        
+        # Get all mappings
+        mappings = list(db.locality_booth_mapping.find())
+        
+        # Find the best match
+        best_match = None
+        matched_locality = None
+        
+        for mapping in mappings:
+            for locality in mapping['locality_names']:
+                # Check if locality name appears in the address
+                if locality in address:
+                    best_match = {
+                        'booth_id': mapping['booth_id'],
+                        'booth_name': mapping['booth_name'],
+                        'matched_locality': locality
+                    }
+                    break
+            
+            if best_match:
+                break
+        
+        if best_match:
+            return jsonify({
+                'success': True,
+                'booth': best_match,  # ← Changed from 'allocation' to 'booth' for consistency
+                'message': f'Booth allocated based on locality: {best_match["matched_locality"]}'
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'No matching booth found for this address. Please assign manually.',
+                'booth': None
+            }), 200
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# 5. Bulk Analyze Addresses
+# ============================================
+@booth_allocation_bp.route('/bulk-analyze', methods=['POST'])  # ← Removed /api/booth-allocation/
+def bulk_analyze():
+    """
+    Analyze multiple addresses at once.
+    Example: { "addresses": ["610/1119, Keshav Nagar, Delhi", "25A/2310, Gandhi Nagar, Delhi"] }
+    """
+    try:
+        db = current_app.mongo.db  # ← Fixed: Use current_app.mongo.db
+        data = request.json
+        addresses = data.get('addresses', [])
+        
+        if not addresses:
+            return jsonify({'error': 'addresses array is required'}), 400
+        
+        mappings = list(db.locality_booth_mapping.find())
+        results = []
+        
+        for address in addresses:
+            address_lower = address.strip().lower()
+            matched = False
+            
+            for mapping in mappings:
+                for locality in mapping['locality_names']:
+                    if locality in address_lower:
+                        results.append({
+                            'address': address,
+                            'booth_id': mapping['booth_id'],
+                            'booth_name': mapping['booth_name'],
+                            'matched_locality': locality
+                        })
+                        matched = True
+                        break
+                
+                if matched:
+                    break
+            
+            if not matched:
+                results.append({
+                    'address': address,
+                    'booth_id': None,
+                    'booth_name': 'No Match Found',
+                    'matched_locality': None
+                })
+        
+        return jsonify({'results': results}), 200
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================
+# 6. Get Booth Statistics
+# ============================================
+@booth_allocation_bp.route('/stats', methods=['GET'])
+def get_booth_stats():
+    """Get statistics about booth allocations"""
+    try:
+        db = current_app.mongo.db  # ← Fixed: Use current_app.mongo.db
+        
+        total_mappings = db.locality_booth_mapping.count_documents({})
+        
+        # Count total localities covered
+        all_mappings = list(db.locality_booth_mapping.find())
+        total_localities = sum(len(mapping['locality_names']) for mapping in all_mappings)
+        
+        return jsonify({
+            'total_booths_mapped': total_mappings,
+            'total_localities_covered': total_localities
+        }), 200
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+# 7. Auto-Generate Booth Allocations from Voter Data
+# ============================================
+@booth_allocation_bp.route('/auto-generate', methods=['POST'])
+def auto_generate_allocations():
+    """
+    Automatically analyze all voters and create booth-to-locality mappings.
+    Groups 3-4 nearby areas per booth based on existing voter addresses.
+    """
+    try:
+        db = current_app.mongo.db
+        
+        # Get all voters
+        voters = list(db.voters.find())
+        
+        if not voters:
+            return jsonify({
+                'success': False,
+                'message': 'No voters found in database'
+            }), 400
+        
+        # Extract and count unique localities from addresses
+        locality_frequency = {}
+        
+        for voter in voters:
+            address = voter.get('address', '').strip().lower()
+            
+            if not address:
+                continue
+            
+            # Extract potential locality names (common patterns in Indian addresses)
+            locality_patterns = [
+                r'(\w+\s*nagar)',
+                r'(\w+\s*colony)',
+                r'(\w+\s*vihar)',
+                r'(\w+\s*puram)',
+                r'(\w+\s*ganj)',
+                r'(\w+\s*enclave)',
+                r'(\w+\s*extension)',
+                r'(\w+\s*park)',
+                r'(\w+\s*market)',
+                r'(\w+\s*chowk)',
+                r'(\w+\s*road)',
+                r'(\w+\s*marg)',
+                r'(\w+\s*street)'
+            ]
+            
+            for pattern in locality_patterns:
+                matches = re.findall(pattern, address, re.IGNORECASE)
+                for match in matches:
+                    locality_name = match.strip().lower()
+                    # Filter out common words that aren't actual locality names
+                    if locality_name not in ['main road', 'sector road', 'model town']:
+                        locality_frequency[locality_name] = locality_frequency.get(locality_name, 0) + 1
+        
+        if not locality_frequency:
+            return jsonify({
+                'success': False,
+                'message': 'No recognizable locality patterns found in voter addresses. Try adding manual mappings.'
+            }), 400
+        
+        # Sort localities by frequency (most common first)
+        sorted_localities = sorted(locality_frequency.items(), key=lambda x: x[1], reverse=True)
+        
+        # Group localities into booths (3-4 localities per booth)
+        localities_per_booth = 4
+        booth_groups = []
+        temp_group = []
+        
+        for locality, count in sorted_localities:
+            temp_group.append(locality)
+            
+            if len(temp_group) >= localities_per_booth:
+                booth_groups.append(temp_group)
+                temp_group = []
+        
+        # Add remaining localities to the last group
+        if temp_group:
+            if booth_groups:
+                booth_groups[-1].extend(temp_group)
+            else:
+                booth_groups.append(temp_group)
+        
+        # Create booth mappings
+        created_mappings = []
+        updated_mappings = []
+        
+        for idx, locality_group in enumerate(booth_groups, start=1):
+            booth_id = f"BOOTH{str(idx).zfill(3)}"
+            
+            # Create a descriptive booth name based on the first locality
+            primary_locality = locality_group[0].title()
+            booth_name = f"Polling Station {idx} - {primary_locality} Area"
+            
+            # Check if booth already exists
+            existing = db.locality_booth_mapping.find_one({'booth_id': booth_id})
+            
+            if existing:
+                # Update existing booth
+                db.locality_booth_mapping.update_one(
+                    {'booth_id': booth_id},
+                    {'$set': {
+                        'locality_names': locality_group,
+                        'booth_name': booth_name
+                    }}
+                )
+                updated_mappings.append(booth_id)
+            else:
+                # Create new booth
+                db.locality_booth_mapping.insert_one({
+                    'booth_id': booth_id,
+                    'booth_name': booth_name,
+                    'locality_names': locality_group
+                })
+                created_mappings.append(booth_id)
+            
+            # Prepare result data
+            voter_count = sum(locality_frequency[loc] for loc in locality_group)
+        
+        total_created = len(created_mappings)
+        total_updated = len(updated_mappings)
+        
+        return jsonify({
+            'success': True,
+            'message': f'Successfully processed {len(booth_groups)} booth allocations ({total_created} created, {total_updated} updated)',
+            'total_localities_found': len(sorted_localities),
+            'total_voters_analyzed': len(voters),
+            'booths_created': total_created,
+            'booths_updated': total_updated,
+            'locality_summary': dict(sorted_localities[:10])  # Top 10 localities
+        }), 200
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500  
